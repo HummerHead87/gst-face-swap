@@ -12,8 +12,7 @@ export GST_PLUGIN_PATH="/home/rustam/Рабочий стол/face-swap/gst-face-
 тестовый пайплайн
 
 ```
-gst-launch-1.0 autovideosrc ! videoconvert ! rsfaceswap ! videoconvert ! autovideosink
-gst-launch-1.0 videotestsrc ! videoconvert ! rsfaceswap ! videoconvert ! autovideosink
+gst-launch-1.0 autovideosrc ! videoconvert ! rsfaceswap face=../bradley.jpeg ! videoconvert ! autovideosink
 ```
 
 пайплайн с транскодингом

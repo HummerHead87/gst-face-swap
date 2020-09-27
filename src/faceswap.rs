@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 
+use opencv::imgcodecs::{imread, IMREAD_UNCHANGED};
 use opencv::prelude::*;
 use opencv::{
     core::{self, Mat, Point, Scalar, Vector},
@@ -32,6 +33,33 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     )
 });
 
+static PROPERTIES: [subclass::Property; 1] = [subclass::Property("face", |name| {
+    glib::ParamSpec::string(
+        name,
+        "Face",
+        "Path to image with face to change to",
+        None,
+        glib::ParamFlags::READWRITE,
+    )
+})];
+
+#[derive(Debug, Clone)]
+struct Settings {
+    source_img_path: Option<String>,
+    source_mat: Option<Mat>,
+    indexes_triangles: Option<Vec<(usize, usize, usize)>>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            source_mat: None,
+            source_img_path: None,
+            indexes_triangles: None,
+        }
+    }
+}
+
 struct State {
     in_info: gst_video::VideoInfo,
     out_info: gst_video::VideoInfo,
@@ -49,6 +77,7 @@ struct FaceSwap {
     state: Mutex<Option<State>>,
     detector: Mutex<CascadeClassifier>,
     landmark_detector: Mutex<LandmarkDetector>,
+    settings: Mutex<Settings>,
 }
 
 impl FaceSwap {}
@@ -71,6 +100,7 @@ impl ObjectSubclass for FaceSwap {
             state: Mutex::new(None),
             detector: Mutex::new(detector),
             landmark_detector: Mutex::new(LandmarkDetector(landmark_detector)),
+            settings: Mutex::new(Default::default()),
         }
     }
 
@@ -87,6 +117,8 @@ impl ObjectSubclass for FaceSwap {
             false,
             false,
         );
+
+        klass.install_properties(&PROPERTIES);
 
         let caps = gst::Caps::new_simple(
             "video/x-raw",
@@ -141,6 +173,126 @@ impl ObjectSubclass for FaceSwap {
 
 impl ObjectImpl for FaceSwap {
     glib_object_impl!();
+
+    fn set_property(&self, obj: &glib::Object, id: usize, value: &glib::Value) {
+        let prop = &PROPERTIES[id];
+        let element = obj.downcast_ref::<BaseTransform>().unwrap();
+
+        match *prop {
+            subclass::Property("face", ..) => {
+                let mut settings = self.settings.lock().unwrap();
+
+                let img_path = value
+                    .get::<String>()
+                    .unwrap()
+                    .expect("type checked upstream");
+
+                let mat = imread(&img_path, IMREAD_UNCHANGED).expect("Can't open file");
+
+                let mut gray = Mat::zeros(mat.rows(), mat.cols(), core::CV_8UC1)
+                    .unwrap()
+                    .to_mat()
+                    .unwrap();
+                imgproc::cvt_color(&mat, &mut gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
+
+                let faces = {
+                    let mut faces = types::VectorOfRect::new();
+                    let mut detector = self.detector.lock().unwrap();
+
+                    detector
+                        .detect_multi_scale(
+                            &gray,
+                            &mut faces,
+                            1.05,
+                            5,
+                            0,
+                            core::Size::new(200, 200),
+                            core::Size::new(5000, 5000),
+                        )
+                        .unwrap();
+
+                    match faces.len() {
+                        1 => Ok(faces),
+                        0 => {
+                            gst_element_error!(
+                                element,
+                                gst::CoreError::Failed,
+                                ["No faces found in source"]
+                            );
+                            Err(gst::FlowError::Error)
+                        }
+                        _ => {
+                            gst_element_error!(
+                                element,
+                                gst::CoreError::Failed,
+                                ["Found more than 1 face in source"]
+                            );
+                            Err(gst::FlowError::Error)
+                        }
+                    }
+                    .unwrap()
+                };
+
+                let landmarks = {
+                    let mut landmarks: Vector<Vector<core::Point2f>> = Vector::new();
+
+                    let mut landmark_detector = self.landmark_detector.lock().unwrap();
+                    landmark_detector
+                        .0
+                        .fit(&gray, &faces, &mut landmarks)
+                        .unwrap();
+
+                    landmarks.get(0).unwrap()
+                };
+
+                let mut convexhull: Vector<core::Point> = Vector::new();
+                let points =
+                    types::VectorOfPoint::from_iter(landmarks.iter().map(|p| p.to().unwrap()));
+                imgproc::convex_hull(&points, &mut convexhull, true, true).unwrap();
+
+                // Delaunau triangulation
+                let rect = imgproc::bounding_rect(&convexhull).unwrap();
+                let mut subdiv = imgproc::Subdiv2D::new(rect).unwrap();
+                subdiv.insert_multiple(&landmarks).unwrap();
+
+                let mut triangles: types::VectorOfVec6f = Vector::new();
+                subdiv.get_triangle_list(&mut triangles).unwrap();
+
+                let mut indexes_triangles = Vec::new();
+                let landmarks_vec = landmarks.to_vec();
+                for t in triangles {
+                    let index_pt1 = find_index_in_vec(&landmarks_vec, t[0], t[1]);
+                    let index_pt2 = find_index_in_vec(&landmarks_vec, t[2], t[3]);
+                    let index_pt3 = find_index_in_vec(&landmarks_vec, t[4], t[5]);
+
+                    if let (Some(index_pt1), Some(index_pt2), Some(index_pt3)) =
+                        (index_pt1, index_pt2, index_pt3)
+                    {
+                        indexes_triangles.push((index_pt1, index_pt2, index_pt3));
+                    }
+                }
+
+                gst_info!(CAT, obj: element, "Applying new face",);
+
+                settings.source_img_path = Some(img_path);
+                settings.source_mat = Some(mat);
+                settings.indexes_triangles = Some(indexes_triangles);
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
+        let prop = &PROPERTIES[id];
+
+        match *prop {
+            subclass::Property("face", ..) => {
+                let settings = self.settings.lock().unwrap();
+                Ok(settings.source_img_path.to_value())
+            }
+            _ => unimplemented!(),
+        }
+    }
 }
 
 impl ElementImpl for FaceSwap {}
@@ -228,6 +380,17 @@ impl BaseTransformImpl for FaceSwap {
         inbuf: &gst::Buffer,
         outbuf: &mut gst::BufferRef,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
+        let settings = self.settings.lock().unwrap();
+
+        let indexes_triangles = settings.indexes_triangles.as_ref().ok_or_else(|| {
+            gst_element_error!(
+                element,
+                gst::CoreError::Failed,
+                ["Provide an image with source face"]
+            );
+            gst::FlowError::Error
+        })?;
+
         let mut state_guard = self.state.lock().unwrap();
         let state = state_guard.as_mut().ok_or_else(|| {
             gst_element_error!(element, gst::CoreError::Negotiation, ["Have no state yet"]);
@@ -307,41 +470,13 @@ impl BaseTransformImpl for FaceSwap {
         };
 
         for landmark in landmarks {
-            // print!("{:?}", landmark);
-            // let mut points: Vector<Point> = Vector::new();
-            // print!("landmarks count: {}", landmark.len());
-            // let landmark_clone = landmark.clone();
-            // let landmark_vec = landmark.to_vec();
-
-            // {
+            // let mut convexhull = types::VectorOfPoint::new();
+            // let points = {
             //     let landmark = &landmark;
-            //     for point in landmark {
-            //         let x = point.x;
-            //         let y = point.y;
+            //     types::VectorOfPoint::from_iter(landmark.iter().map(|p| p.to().unwrap()))
+            // };
 
-            //         let point = Point::new(x as i32, y as i32);
-            //         // points.push(point);
-
-            //         imgproc::circle(
-            //             &mut frame,
-            //             point,
-            //             2,
-            //             Scalar::new(0.0, 0.0, 255.0, 0.0),
-            //             -1,
-            //             1,
-            //             0,
-            //         )
-            //         .unwrap();
-            //     }
-            // }
-
-            let mut convexhull = types::VectorOfPoint::new();
-            let points = {
-                let landmark = &landmark;
-                types::VectorOfPoint::from_iter(landmark.iter().map(|p| p.to().unwrap()))
-            };
-
-            imgproc::convex_hull(&points, &mut convexhull, true, true).unwrap();
+            // imgproc::convex_hull(&points, &mut convexhull, true, true).unwrap();
             // imgproc::polylines(
             //     &mut frame,
             //     &convexhull,
@@ -353,18 +488,10 @@ impl BaseTransformImpl for FaceSwap {
             // )
             // .unwrap();
 
-            // Delaunau triangulation
-            let rect = imgproc::bounding_rect(&convexhull).unwrap();
-            let mut subdiv = imgproc::Subdiv2D::new(rect).unwrap();
-            subdiv.insert_multiple(&landmark).unwrap();
-
-            let mut triangles = types::VectorOfVec6f::new();
-            subdiv.get_triangle_list(&mut triangles).unwrap();
-
-            for t in triangles {
-                let pt1 = Point::new(t[0] as i32, t[1] as i32);
-                let pt2 = Point::new(t[2] as i32, t[3] as i32);
-                let pt3 = Point::new(t[4] as i32, t[5] as i32);
+            for triangle_index in indexes_triangles {
+                let pt1 = landmark.get(triangle_index.0).unwrap().to().unwrap();
+                let pt2 = landmark.get(triangle_index.1).unwrap().to().unwrap();
+                let pt3 = landmark.get(triangle_index.2).unwrap().to().unwrap();
 
                 imgproc::line(
                     &mut frame,
