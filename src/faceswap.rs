@@ -452,12 +452,7 @@ impl BaseTransformImpl for FaceSwap {
                 Err(gst::FlowError::Error)
             })?;
 
-        let mut new_face = core::Mat::new_size_with_default(
-            frame.size().unwrap(),
-            core::CV_8UC3,
-            Scalar::new(0.0, 0.0, 0.0, 0.0),
-        )
-        .unwrap();
+        let mut new_frame = frame.clone();
 
         let mut gray = core::Mat::default().unwrap();
         imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
@@ -510,13 +505,12 @@ impl BaseTransformImpl for FaceSwap {
         };
 
         for landmark in landmarks {
-            // let mut convexhull = types::VectorOfPoint::new();
-            // let points = {
-            //     let landmark = &landmark;
-            //     types::VectorOfPoint::from_iter(landmark.iter().map(|p| p.to().unwrap()))
-            // };
-
-            // imgproc::convex_hull(&points, &mut convexhull, true, true).unwrap();
+            let mut convexhull = types::VectorOfPoint::new();
+            let points = {
+                let landmark = &landmark;
+                types::VectorOfPoint::from_iter(landmark.iter().map(|p| p.to().unwrap()))
+            };
+            imgproc::convex_hull(&points, &mut convexhull, true, true).unwrap();
             // imgproc::polylines(
             //     &mut frame,
             //     &convexhull,
@@ -527,6 +521,13 @@ impl BaseTransformImpl for FaceSwap {
             //     0,
             // )
             // .unwrap();
+
+            let mut new_face = core::Mat::new_size_with_default(
+                frame.size().unwrap(),
+                core::CV_8UC3,
+                Scalar::new(0.0, 0.0, 0.0, 0.0),
+            )
+            .unwrap();
 
             for triangle_data in triangles_data {
                 let triangle_indexes = &triangle_data.point_indexes;
@@ -634,12 +635,6 @@ impl BaseTransformImpl for FaceSwap {
                 .unwrap();
 
                 // Reconstruct destination face
-                // println!(
-                //     "new face size rows: {}, cols: {}",
-                //     new_face.rows(),
-                //     new_face.cols()
-                // );
-                // println!("rect size: {:?}, x: {}, y: {}", rect.size(), rect.x, rect.y);
                 let triangle_area = Mat::roi(&new_face, rect).unwrap();
                 let mut triangle_area_gray = Mat::zeros_size(rect.size(), core::CV_8UC1)
                     .unwrap()
@@ -680,24 +675,79 @@ impl BaseTransformImpl for FaceSwap {
                 )
                 .unwrap();
 
-                let mut triangle_area_result = Mat::new_size_with_default(
-                    rect.size(),
-                    core::CV_8UC3,
-                    Scalar::new(0.0, 0.0, 0.0, 0.0),
-                )
-                .unwrap();
-                core::add(
-                    &triangle_area,
-                    &trangle_area_fill,
-                    &mut triangle_area_result,
-                    &core::no_array().unwrap(),
-                    -1,
-                )
-                .unwrap();
+                let triangle_area_result = core::add_mat_mat(&triangle_area, &trangle_area_fill)
+                    .unwrap()
+                    .to_mat()
+                    .unwrap();
 
                 let mut new_face_part = Mat::roi(&new_face, rect).unwrap();
                 triangle_area_result.copy_to(&mut new_face_part).unwrap();
             }
+
+            let size = new_face.size().unwrap();
+            // let mut face_mask = Mat::zeros_size(size, core::CV_8UC1)
+            //     .unwrap()
+            //     .to_mat()
+            //     .unwrap();
+            let mut head_mask = Mat::zeros_size(size, core::CV_8UC1)
+                .unwrap()
+                .to_mat()
+                .unwrap();
+
+            imgproc::fill_convex_poly(
+                &mut head_mask,
+                &convexhull,
+                Scalar::new(255.0, 0.0, 0.0, 0.0),
+                1,
+                0,
+            )
+            .unwrap();
+            // core::bitwise_not(&head_mask, &mut face_mask, &core::no_array().unwrap()).unwrap();
+
+            // let mut new_frame_noface = Mat::zeros_size(frame.size().unwrap(), core::CV_8UC3)
+            //     .unwrap()
+            //     .to_mat()
+            //     .unwrap();
+            // core::bitwise_and(&new_frame, &new_frame, &mut new_frame_noface, &face_mask).unwrap();
+
+            // let result = core::add_mat_mat(&new_frame_noface, &new_face)
+            //     .unwrap()
+            //     .to_mat()
+            //     .unwrap();
+            // new_frame = result;
+            let mut seamless_clone = Mat::zeros_size(frame.size().unwrap(), core::CV_8UC3)
+                .unwrap()
+                .to_mat()
+                .unwrap();
+            let rect_face = imgproc::bounding_rect(&convexhull).unwrap();
+            let center_face = Point::new(
+                rect_face.x + rect_face.width / 2,
+                rect_face.y + rect_face.height / 2,
+            );
+            // let center_face = (rect_face.tl() + rect_face.br()) / 2;
+            // println!("center_face: {:?}", center_face);
+            // let center_face = Point::new(640, 360);
+            // imgproc::rectangle(
+            //     &mut head_mask,
+            //     core::Rect::new(0, 0, frame.cols() - 2, frame.rows() - 2),
+            //     Scalar::new(0.0, 0.0, 0.0, 0.0),
+            //     1,
+            //     1,
+            //     0,
+            // )
+            // .unwrap();
+
+            opencv::photo::seamless_clone(
+                &new_face,
+                &frame,
+                &head_mask,
+                center_face,
+                &mut seamless_clone,
+                opencv::photo::NORMAL_CLONE,
+            )
+            .unwrap();
+
+            new_frame = seamless_clone;
         }
 
         let mut out_frame =
@@ -712,7 +762,7 @@ impl BaseTransformImpl for FaceSwap {
                 },
             )?;
 
-        cv_mat_to_gst_buf(&mut out_frame, &new_face, width as usize).or_else(|err| {
+        cv_mat_to_gst_buf(&mut out_frame, &new_frame, width as usize).or_else(|err| {
             gst_element_error!(
                 element,
                 gst::CoreError::Failed,
