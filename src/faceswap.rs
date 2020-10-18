@@ -14,16 +14,18 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 
+use dlib_face_recognition as dlib;
 use opencv::imgcodecs::{imread, IMREAD_UNCHANGED};
 use opencv::prelude::*;
 use opencv::{
     core::{self, Mat, Point, Scalar, Vector},
-    face, imgproc,
+    imgproc,
     objdetect::CascadeClassifier,
     types,
 };
 
 use crate::convert::{cv_mat_to_gst_buf, gst_buffer_to_cv_mat};
+use crate::helpers::detect_landmarks;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -72,14 +74,14 @@ struct State {
     out_info: gst_video::VideoInfo,
 }
 
-struct LandmarkDetector(core::Ptr<dyn face::Facemark>);
-unsafe impl Send for LandmarkDetector {}
-unsafe impl Sync for LandmarkDetector {}
+// struct LandmarkDetector(core::Ptr<dyn face::Facemark>);
+// unsafe impl Send for LandmarkDetector {}
+// unsafe impl Sync for LandmarkDetector {}
 
 struct FaceSwap {
     state: Mutex<Option<State>>,
     detector: Mutex<CascadeClassifier>,
-    landmark_detector: Mutex<LandmarkDetector>,
+    landmark_predictor: Mutex<dlib::LandmarkPredictor>,
     settings: Mutex<Settings>,
 }
 
@@ -96,13 +98,14 @@ impl ObjectSubclass for FaceSwap {
 
     fn new() -> Self {
         let detector = CascadeClassifier::new("../haarcascade_frontalface_alt2.xml").unwrap();
-        let mut landmark_detector = face::create_facemark_lbf().unwrap();
-        landmark_detector.load_model("../lbfmodel.yaml").unwrap();
+        // let mut landmark_detector = face::create_facemark_lbf().unwrap();
+        // landmark_detector.load_model("../lbfmodel.yaml").unwrap();
+        let landmark_predictor = dlib::LandmarkPredictor::default();
 
         Self {
             state: Mutex::new(None),
             detector: Mutex::new(detector),
-            landmark_detector: Mutex::new(LandmarkDetector(landmark_detector)),
+            landmark_predictor: Mutex::new(landmark_predictor),
             settings: Mutex::new(Default::default()),
         }
     }
@@ -237,15 +240,9 @@ impl ObjectImpl for FaceSwap {
                 };
 
                 let landmarks = {
-                    let mut landmarks: Vector<Vector<core::Point2f>> = Vector::new();
+                    let predictor = self.landmark_predictor.lock().unwrap();
 
-                    let mut landmark_detector = self.landmark_detector.lock().unwrap();
-                    landmark_detector
-                        .0
-                        .fit(&gray, &faces, &mut landmarks)
-                        .unwrap();
-
-                    landmarks.get(0).unwrap()
+                    detect_landmarks(&predictor, &mat, &faces.get(0).unwrap()).unwrap()
                 };
 
                 let mut convexhull: Vector<core::Point> = Vector::new();
@@ -442,7 +439,7 @@ impl BaseTransformImpl for FaceSwap {
                     Err(gst::FlowError::Error)
                 })?;
 
-        let mut frame =
+        let frame =
             gst_buffer_to_cv_mat(&in_frame, width as i32, height as i32).or_else(|err| {
                 gst_element_error!(
                     element,
@@ -492,19 +489,24 @@ impl BaseTransformImpl for FaceSwap {
         //     }
         // }
 
-        let landmarks = {
-            let mut landmarks: Vector<Vector<core::Point2f>> = Vector::new();
+        // let landmarks = {
+        //     let mut landmarks: Vector<Vector<core::Point2f>> = Vector::new();
 
-            let mut landmark_detector = self.landmark_detector.lock().unwrap();
-            landmark_detector
-                .0
-                .fit(&gray, &faces, &mut landmarks)
-                .unwrap();
+        //     let mut landmark_detector = self.landmark_predictor.lock().unwrap();
+        //     landmark_detector
+        //         .0
+        //         .fit(&gray, &faces, &mut landmarks)
+        //         .unwrap();
 
-            landmarks
-        };
+        //     landmarks
+        // };
 
-        for landmark in landmarks {
+        for face in faces {
+            let landmark = {
+                let predictor = self.landmark_predictor.lock().unwrap();
+                detect_landmarks(&predictor, &frame, &face).unwrap()
+            };
+
             let mut convexhull = types::VectorOfPoint::new();
             let points = {
                 let landmark = &landmark;
@@ -522,7 +524,7 @@ impl BaseTransformImpl for FaceSwap {
             // )
             // .unwrap();
 
-            let mut new_face = core::Mat::new_size_with_default(
+            let new_face = core::Mat::new_size_with_default(
                 frame.size().unwrap(),
                 core::CV_8UC3,
                 Scalar::new(0.0, 0.0, 0.0, 0.0),
@@ -720,10 +722,30 @@ impl BaseTransformImpl for FaceSwap {
                 .to_mat()
                 .unwrap();
             let rect_face = imgproc::bounding_rect(&convexhull).unwrap();
+
+            // Какой-то баг с seamless_clone. Если центр и половина высоты клонируемого изображения
+            // больше высоты исходного изображения, то seamless_clone впадает в панику.
+            // Наблюдается в OpenCV 4.1.2
+            // NEED_INVESTIGATION: возможно это баг в OpenCV. Попробовать другие версии
+            let center_y = {
+                let half_height = rect_face.height / 2;
+                let mut y = rect_face.y + half_height;
+                if y + half_height > frame.rows() {
+                    y = frame.rows() - half_height;
+                }
+
+                y
+            };
             let center_face = Point::new(
                 rect_face.x + rect_face.width / 2,
-                rect_face.y + rect_face.height / 2,
+                // (rect_face.y + rect_face.height / 2) - 50,
+                // rect_face.y + rect_face.height / 2,
+                // 360
+                center_y,
             );
+            print!("center_face y: {}, ", center_face.y);
+            print!("rect_face height: {}, ", rect_face.height);
+            println!("y + h/2: {}", center_face.y + rect_face.height / 2);
             // let center_face = (rect_face.tl() + rect_face.br()) / 2;
             // println!("center_face: {:?}", center_face);
             // let center_face = Point::new(640, 360);

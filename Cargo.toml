@@ -16,6 +16,8 @@ gstreamer-video = "0.16.3"
 once_cell = "1.4.1"
 opencv = {version = "0.46", features = ["opencv-4", "buildtime-bindgen", "contrib"]}
 anyhow = "1.0.32"
+dlib-face-recognition = {verison = "0.1.7", features = ['embed-all']}
+image = "0.23.10"
 
 [lib]
 name = "gstrsfaceswap"

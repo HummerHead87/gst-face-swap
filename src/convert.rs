@@ -14,6 +14,7 @@ pub fn gst_buffer_to_cv_mat(
 ) -> Result<Mat, Error> {
     // неправильно работает, т.к. opencv считает что pixel stride равен 3, а у gstreamer прилетает
     // изображение с pixel stride 4
+    // TODO: надо попробовать как здесь https://stackoverflow.com/questions/58155836/how-to-use-rust-opencv-imdecode
     // let frame: Mat;
     // let size = core::Size::new(width as i32, height as i32);
 

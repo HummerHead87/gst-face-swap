@@ -7,6 +7,7 @@ extern crate gstreamer_video as gst_video;
 extern crate once_cell;
 
 pub mod convert;
+pub mod helpers;
 mod faceswap;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
